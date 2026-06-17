@@ -22,6 +22,8 @@ Current focus:
 BiSST/
 ├── data/
 │   ├── raw/
+│   │    ├── real/
+│   │    └── virtual/
 │   ├── processed/
 │   └── masks/
 ├── src/
