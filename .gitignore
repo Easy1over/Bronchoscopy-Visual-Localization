@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+runs/
+wandb/
+
+# Data: keep folders, ignore contents
+data/raw/*
+data/processed/*
+data/masks/*
+data/splits/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/masks/.gitkeep
+!data/splits/.gitkeep
+
+# Checkpoints and weights: keep folder, ignore contents
+checkpoints/*
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.pickle
+!checkpoints/.gitkeep
+
+# Results: keep folder, ignore contents
+results/*
+outputs/
+experiments/
+!results/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
