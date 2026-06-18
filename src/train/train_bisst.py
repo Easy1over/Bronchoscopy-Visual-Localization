@@ -83,12 +83,43 @@ def parse_args():
         default=0,
         help="Number of dataloader workers. Use 0 on Windows.",
     )
+
+    # Backward-compatible learning rate
     parser.add_argument(
         "--lr",
         type=float,
         default=0.0002,
-        help="Initial learning rate.",
+        help="Fallback initial learning rate. Used by lr_G/lr_D when they are not set.",
     )
+
+    # TTUR / separate learning rates
+    parser.add_argument(
+        "--lr_G",
+        type=float,
+        default=None,
+        help="Initial learning rate for generator-side optimizers. If None, use --lr.",
+    )
+    parser.add_argument(
+        "--lr_D",
+        type=float,
+        default=None,
+        help="Initial learning rate for discriminator optimizer. If None, use --lr.",
+    )
+
+    # Update frequency control
+    parser.add_argument(
+        "--g_update_freq",
+        type=int,
+        default=1,
+        help="Update generator every N steps. Default 1 keeps old behavior.",
+    )
+    parser.add_argument(
+        "--d_update_freq",
+        type=int,
+        default=1,
+        help="Update discriminator every N steps. Use 2 or 3 to weaken D. Default 1 keeps old behavior.",
+    )
+
     parser.add_argument(
         "--beta1",
         type=float,
@@ -379,6 +410,22 @@ def parse_args():
     return parser.parse_args()
 
 
+def finalize_args(args):
+    """
+    Fill backward-compatible defaults and sanitize update frequencies.
+    """
+    if args.lr_G is None:
+        args.lr_G = args.lr
+
+    if args.lr_D is None:
+        args.lr_D = args.lr
+
+    args.g_update_freq = max(1, int(args.g_update_freq))
+    args.d_update_freq = max(1, int(args.d_update_freq))
+
+    return args
+
+
 def format_loss_dict(loss_dict: Dict[str, float]) -> str:
     parts = []
 
@@ -410,6 +457,10 @@ def save_run_info(
         f.write("batch_size: {}\n".format(args.batch_size))
         f.write("num_workers: {}\n".format(args.num_workers))
         f.write("lr: {}\n".format(args.lr))
+        f.write("lr_G: {}\n".format(args.lr_G))
+        f.write("lr_D: {}\n".format(args.lr_D))
+        f.write("g_update_freq: {}\n".format(args.g_update_freq))
+        f.write("d_update_freq: {}\n".format(args.d_update_freq))
         f.write("beta1: {}\n".format(args.beta1))
         f.write("beta2: {}\n".format(args.beta2))
         f.write("lr_policy: {}\n".format(args.lr_policy))
@@ -505,7 +556,10 @@ def append_current_loss(
     loss_fieldnames,
     epoch: int,
     step: int,
-    lr: float,
+    lr_G: float,
+    lr_D: float,
+    update_G: bool,
+    update_D: bool,
     loss_dict: Dict[str, float],
 ) -> None:
     """
@@ -520,7 +574,14 @@ def append_current_loss(
 
     log_row["epoch"] = epoch
     log_row["step"] = step
-    log_row["lr"] = lr
+
+    # Keep old field name "lr" for backward compatibility.
+    # It now records generator-side learning rate.
+    log_row["lr"] = lr_G
+    log_row["lr_G"] = lr_G
+    log_row["lr_D"] = lr_D
+    log_row["update_G"] = int(update_G)
+    log_row["update_D"] = int(update_D)
 
     for key, value in loss_dict.items():
         if key in log_row:
@@ -669,28 +730,122 @@ def get_lr_scale(
     raise ValueError("Unsupported lr_policy: {}".format(args.lr_policy))
 
 
-def set_optimizer_lr(
+def set_optimizer_lrs(
     model: BiSSTModel,
-    lr: float,
+    lr_G: float,
+    lr_D: float,
 ) -> None:
+    """
+    Set separate learning rates for generator-side and discriminator optimizers.
+
+    Expected optimizer names from model.get_optimizer_dict():
+        "G" for generator-side optimizer
+        "D" for discriminator optimizer
+
+    For safety, every optimizer whose name is not exactly "D" uses lr_G.
+    This keeps compatibility with possible optimizers such as F, Eh, Fmask, etc.
+    """
     optimizers = model.get_optimizer_dict()
 
-    for _, optimizer in optimizers.items():
+    for name, optimizer in optimizers.items():
+        if name == "D":
+            target_lr = lr_D
+        else:
+            target_lr = lr_G
+
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            param_group["lr"] = target_lr
+
+
+def get_current_lrs(
+    model: BiSSTModel,
+):
+    """
+    Return current generator-side and discriminator learning rates.
+    """
+    optimizers = model.get_optimizer_dict()
+
+    lr_G = None
+    lr_D = None
+
+    if "G" in optimizers:
+        lr_G = optimizers["G"].param_groups[0]["lr"]
+
+    if "D" in optimizers:
+        lr_D = optimizers["D"].param_groups[0]["lr"]
+
+    return lr_G, lr_D
 
 
 def get_current_lr(
     model: BiSSTModel,
 ) -> float:
-    optimizers = model.get_optimizer_dict()
-    optimizer_G = optimizers["G"]
+    """
+    Backward-compatible helper.
 
-    return optimizer_G.param_groups[0]["lr"]
+    Return generator-side LR if available.
+    """
+    lr_G, _ = get_current_lrs(model)
+
+    if lr_G is None:
+        return 0.0
+
+    return lr_G
+
+
+def compute_update_flags(
+    global_step: int,
+    args,
+):
+    """
+    Decide whether to update G and D at this step.
+
+    Default:
+        g_update_freq = 1
+        d_update_freq = 1
+
+    Then both G and D are updated every step, which matches old behavior.
+    """
+    update_G = (global_step % args.g_update_freq == 0)
+    update_D = (global_step % args.d_update_freq == 0)
+
+    return update_G, update_D
+
+
+def optimize_model_parameters(
+    model: BiSSTModel,
+    update_G: bool,
+    update_D: bool,
+):
+    """
+    Compatibility wrapper.
+
+    After src/models/bisst.py is updated, BiSSTModel.optimize_parameters()
+    should support:
+        optimize_parameters(update_G=True, update_D=True)
+
+    Before that update, this wrapper still allows old behavior only when
+    both update_G and update_D are True.
+    """
+    try:
+        return model.optimize_parameters(
+            update_G=update_G,
+            update_D=update_D,
+        )
+    except TypeError as exc:
+        if update_G and update_D:
+            return model.optimize_parameters()
+
+        raise TypeError(
+            "BiSSTModel.optimize_parameters() does not yet support "
+            "update_G/update_D. Please update src/models/bisst.py before using "
+            "g_update_freq or d_update_freq values other than 1."
+        ) from exc
 
 
 def main():
     args = parse_args()
+    args = finalize_args(args)
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA is not available. Fall back to CPU.")
@@ -749,6 +904,10 @@ def main():
         "epoch",
         "step",
         "lr",
+        "lr_G",
+        "lr_D",
+        "update_G",
+        "update_D",
         "loss_D",
         "loss_G_total",
         "loss_G_GAN",
@@ -778,6 +937,12 @@ def main():
     print("Run info saved to:", run_info_path)
     print("Loss log saved to:", loss_log_path)
     print("Device:", args.device)
+    print("Base lr:", args.lr)
+    print("Initial lr_G:", args.lr_G)
+    print("Initial lr_D:", args.lr_D)
+    print("G update freq:", args.g_update_freq)
+    print("D update freq:", args.d_update_freq)
+    print("LR policy:", args.lr_policy)
 
     dataset = UnpairedBronchoscopyDataset(
         virtual_dir=args.virtual_dir,
@@ -865,35 +1030,59 @@ def main():
             args=args,
         )
 
-        current_lr = args.lr * lr_scale
+        current_lr_G = args.lr_G * lr_scale
+        current_lr_D = args.lr_D * lr_scale
 
-        set_optimizer_lr(
+        set_optimizer_lrs(
             model=model,
-            lr=current_lr,
+            lr_G=current_lr_G,
+            lr_D=current_lr_D,
         )
 
         print("")
         print("========== Epoch {}/{} ==========".format(epoch, args.epochs))
-        print("Current LR:", current_lr)
+        print("Current LR G:", current_lr_G)
+        print("Current LR D:", current_lr_D)
 
         last_loss_dict = None
+        last_update_G = True
+        last_update_D = True
 
         for batch_idx, batch in enumerate(dataloader):
             global_step += 1
 
+            update_G, update_D = compute_update_flags(
+                global_step=global_step,
+                args=args,
+            )
+
+            last_update_G = update_G
+            last_update_D = update_D
+
             model.set_input(batch)
-            loss_dict = model.optimize_parameters()
+
+            loss_dict = optimize_model_parameters(
+                model=model,
+                update_G=update_G,
+                update_D=update_D,
+            )
+
             last_loss_dict = loss_dict
 
             if global_step % args.print_freq == 0:
                 print(
-                    "Epoch [{}/{}] Batch [{}/{}] Step [{}] LR [{:.8f}] {}".format(
+                    "Epoch [{}/{}] Batch [{}/{}] Step [{}] "
+                    "LR_G [{:.8f}] LR_D [{:.8f}] "
+                    "update_G [{}] update_D [{}] {}".format(
                         epoch,
                         args.epochs,
                         batch_idx + 1,
                         len(dataloader),
                         global_step,
-                        current_lr,
+                        current_lr_G,
+                        current_lr_D,
+                        int(update_G),
+                        int(update_D),
                         format_loss_dict(loss_dict),
                     )
                 )
@@ -904,7 +1093,10 @@ def main():
                     loss_fieldnames=loss_fieldnames,
                     epoch=epoch,
                     step=global_step,
-                    lr=current_lr,
+                    lr_G=current_lr_G,
+                    lr_D=current_lr_D,
+                    update_G=update_G,
+                    update_D=update_D,
                     loss_dict=loss_dict,
                 )
 
@@ -929,7 +1121,10 @@ def main():
                 loss_fieldnames=loss_fieldnames,
                 epoch=epoch,
                 step=global_step,
-                lr=current_lr,
+                lr_G=current_lr_G,
+                lr_D=current_lr_D,
+                update_G=last_update_G,
+                update_D=last_update_D,
                 loss_dict=last_loss_dict,
             )
 
@@ -970,6 +1165,8 @@ def main():
             )
         )
 
+    final_lr_G, final_lr_D = get_current_lrs(model)
+
     print("")
     print("========== Training finished ==========")
     print("Run name:", args.run_name)
@@ -977,7 +1174,8 @@ def main():
     print("Checkpoints saved to:", checkpoint_dir)
     print("Visual results saved to:", visual_dir)
     print("Loss log saved to:", loss_log_path)
-    print("Final LR:", get_current_lr(model))
+    print("Final LR G:", final_lr_G)
+    print("Final LR D:", final_lr_D)
 
 
 if __name__ == "__main__":
