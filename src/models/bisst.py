@@ -159,6 +159,12 @@ class BiSSTModel(CUTModel):
         self.h_fake_B = None
         self.h_A_neg = None
 
+        self.idt_B = None
+
+        self.latest_semantic_loss_dict = {}
+        self.latest_loss_tensors = {}
+        self.latest_loss_dict = {}
+
         if self.use_mask_predictor:
             self.M = build_mask_predictor(
                 predictor_type=mask_predictor_type,
@@ -300,6 +306,76 @@ class BiSSTModel(CUTModel):
 
         for param in net.parameters():
             param.requires_grad = False
+
+    @staticmethod
+    def set_requires_grad(
+        nets,
+        requires_grad: bool,
+    ) -> None:
+        """
+        Enable or disable gradients for one network or a list of networks.
+        """
+        if not isinstance(nets, (list, tuple)):
+            nets = [nets]
+
+        for net in nets:
+            if net is None:
+                continue
+
+            for param in net.parameters():
+                param.requires_grad = requires_grad
+
+    @staticmethod
+    def tensor_to_float(
+        value,
+    ) -> float:
+        """
+        Convert tensor / number to Python float for logging.
+        """
+        if torch.is_tensor(value):
+            return float(value.detach().item())
+
+        return float(value)
+
+    def tensor_dict_to_float_dict(
+        self,
+        loss_tensors: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Convert loss tensor dict to float dict.
+        """
+        loss_dict = {}
+
+        for key, value in loss_tensors.items():
+            loss_dict[key] = self.tensor_to_float(value)
+
+        return loss_dict
+
+    def get_zero_loss_tensor(
+        self,
+    ) -> torch.Tensor:
+        return torch.tensor(0.0, device=self.device)
+
+    def get_default_loss_tensors(
+        self,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Default loss tensors used when a branch is skipped before any
+        previous loss exists.
+        """
+        zero = self.get_zero_loss_tensor()
+
+        return {
+            "loss_D": zero,
+            "loss_G_total": zero,
+            "loss_G_GAN": zero,
+            "loss_NCE": zero,
+            "loss_IDT": zero,
+            "loss_mask": zero,
+            "loss_semantic": zero,
+            "loss_sem_pos": zero,
+            "loss_sem_neg": zero,
+        }
 
     def set_loss_weights(
         self,
@@ -580,9 +656,12 @@ class BiSSTModel(CUTModel):
         loss = loss * self.lambda_semantic
         return loss
 
-    def backward_G(self) -> Dict[str, torch.Tensor]:
+    def backward_G(
+        self,
+        do_backward: bool = True,
+    ) -> Dict[str, torch.Tensor]:
         """
-        Update generator side.
+        Compute and optionally backpropagate generator-side losses.
 
         Optimized networks:
             - G
@@ -595,6 +674,14 @@ class BiSSTModel(CUTModel):
             - Identity PatchNCE
             - Dice mask consistency
             - Structural semantic consistency
+
+        Args:
+            do_backward:
+                If True, call loss_G_total.backward().
+                If False, only compute losses for logging.
+
+        Returns:
+            Dictionary of detached loss tensors.
         """
         pred_fake = self.D(self.fake_B)
 
@@ -650,7 +737,8 @@ class BiSSTModel(CUTModel):
             + loss_semantic
         )
 
-        loss_G_total.backward()
+        if do_backward:
+            loss_G_total.backward()
 
         self.idt_B = idt_B
 
@@ -680,6 +768,131 @@ class BiSSTModel(CUTModel):
             "loss_sem_pos": loss_sem_pos.detach(),
             "loss_sem_neg": loss_sem_neg.detach(),
         }
+
+    def extract_loss_D_tensor(
+        self,
+        backward_D_output,
+    ) -> torch.Tensor:
+        """
+        Extract discriminator loss tensor from parent CUTModel.backward_D().
+
+        This keeps compatibility with possible parent implementations:
+            - backward_D() returns a Tensor
+            - backward_D() returns {"loss_D": tensor}
+            - backward_D() sets self.loss_D and returns None
+        """
+        if torch.is_tensor(backward_D_output):
+            return backward_D_output.detach()
+
+        if isinstance(backward_D_output, dict):
+            if "loss_D" in backward_D_output:
+                value = backward_D_output["loss_D"]
+                if torch.is_tensor(value):
+                    return value.detach()
+                return torch.tensor(float(value), device=self.device)
+
+        if hasattr(self, "loss_D"):
+            value = self.loss_D
+            if torch.is_tensor(value):
+                return value.detach()
+            return torch.tensor(float(value), device=self.device)
+
+        return torch.tensor(0.0, device=self.device)
+
+    def optimize_parameters(
+        self,
+        update_G: bool = True,
+        update_D: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Optimize model parameters with optional G/D update scheduling.
+
+        Default behavior:
+            update_G=True, update_D=True
+
+        This matches the old training behavior.
+
+        New behavior for discriminator control:
+            - update_D=False:
+                forward is still computed for current visuals,
+                but discriminator optimizer is not stepped.
+            - update_G=False:
+                generator optimizer is not stepped.
+
+        This is used by train_bisst.py:
+            --g_update_freq
+            --d_update_freq
+
+        Example:
+            g_update_freq=1, d_update_freq=2
+                G updates every step.
+                D updates every 2 steps.
+        """
+        update_G = bool(update_G)
+        update_D = bool(update_D)
+
+        self.forward()
+
+        default_loss_tensors = self.get_default_loss_tensors()
+        current_loss_tensors = {}
+
+        # ---------------------
+        # Update D
+        # ---------------------
+        if update_D:
+            self.set_requires_grad(self.D, True)
+
+            self.optimizer_D.zero_grad()
+
+            backward_D_output = self.backward_D()
+
+            self.optimizer_D.step()
+
+            loss_D = self.extract_loss_D_tensor(backward_D_output)
+            current_loss_tensors["loss_D"] = loss_D
+
+        else:
+            if "loss_D" in self.latest_loss_tensors:
+                current_loss_tensors["loss_D"] = self.latest_loss_tensors["loss_D"]
+            else:
+                current_loss_tensors["loss_D"] = default_loss_tensors["loss_D"]
+
+        # ---------------------
+        # Update G
+        # ---------------------
+        self.set_requires_grad(self.D, False)
+
+        if update_G:
+            self.optimizer_G.zero_grad()
+
+            g_loss_tensors = self.backward_G(
+                do_backward=True,
+            )
+
+            self.optimizer_G.step()
+
+            current_loss_tensors.update(g_loss_tensors)
+
+        else:
+            for key in [
+                "loss_G_total",
+                "loss_G_GAN",
+                "loss_NCE",
+                "loss_IDT",
+                "loss_mask",
+                "loss_semantic",
+                "loss_sem_pos",
+                "loss_sem_neg",
+            ]:
+                if key in self.latest_loss_tensors:
+                    current_loss_tensors[key] = self.latest_loss_tensors[key]
+                else:
+                    current_loss_tensors[key] = default_loss_tensors[key]
+
+        self.latest_loss_tensors = current_loss_tensors
+        self.latest_loss_dict = self.tensor_dict_to_float_dict(current_loss_tensors)
+
+        return self.latest_loss_dict
 
     def get_current_visuals(self) -> Dict[str, torch.Tensor]:
         """
@@ -795,6 +1008,39 @@ if __name__ == "__main__":
 
     for name, tensor in visuals.items():
         print("{} shape: {}".format(name, tensor.shape))
+
+    print("")
+    print("BiSST model test: real2virtual, update D every other step")
+
+    model_r2v_sched = BiSSTModel(
+        ngf=32,
+        ndf=32,
+        n_blocks=3,
+        use_mask_predictor=False,
+        use_embedding_extractor=True,
+        embedding_input_channels=128,
+        lambda_mask=0.0,
+        lambda_semantic=0.0,
+        device="cpu",
+        direction="real2virtual",
+    )
+
+    for step in range(1, 5):
+        model_r2v_sched.set_input(batch)
+        update_D = (step % 2 == 0)
+
+        loss_dict = model_r2v_sched.optimize_parameters(
+            update_G=True,
+            update_D=update_D,
+        )
+
+        print(
+            "Step {} update_G=True update_D={} loss_dict={}".format(
+                step,
+                update_D,
+                loss_dict,
+            )
+        )
 
     print("")
     print("BiSST model test: mask branch enabled without checkpoint")
